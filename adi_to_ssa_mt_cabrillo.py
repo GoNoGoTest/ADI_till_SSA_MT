@@ -5,6 +5,7 @@ Konvertera ADI-exporter till Cabrillo-format för SSA Månadstest.
 Scriptet är avsiktligt byggt för att vara enkelt, förutsägbart och lätt att
 sprida vidare. Fokus ligger därför på:
 
+- En specifik export för SSA Månadstest (inte en generell Cabrillo-export)
 - Tydliga promptar på svenska
 - En enkel config-sektion högst upp
 - Cabrillo-header och QSO-rader som följer fungerande exempeldata
@@ -34,8 +35,8 @@ from typing import Dict, List, Optional
 # - lämna variablerna tomma, eller
 # - byta ut dem mot mer generiska värden.
 #
-# Om ett värde här är tomt försöker scriptet i stället använda relevant data
-# från ADI-filen som förval, när det finns.
+# Om ett värde här är tomt visas inget personligt förval i prompten
+# (undantag: datum får dagens datum om DEFAULT_QSO_DATE är tomt).
 # ---------------------------------------------------------------------------
 
 DEFAULT_MY_GRID = ""
@@ -50,9 +51,6 @@ DEFAULT_MODE = "SSB"
 # ---------------------------------------------------------------------------
 # KONSTANTER FÖR SCRIPTET
 # ---------------------------------------------------------------------------
-APP_NAME = "ADI to SSA MT Cabrillo"
-APP_VERSION = "0.4"
-DEFAULT_CONTEST = "SSA-MT"
 CREATED_BY_VALUE = "ADI-TO-SSA-MT"
 
 
@@ -70,14 +68,12 @@ class QSO:
     index: int
     band: str
     call: str
-    mode: str
     qso_date: str
     time_on: str
     rst_sent: str
-    stx: str
-    my_gridsquare: str
+    stx: int
     rst_rcvd: str
-    srx: str
+    srx: int
     gridsquare: str
     freq: Optional[str] = None
 
@@ -231,30 +227,6 @@ def parse_adif_text(text: str) -> List[Dict[str, str]]:
 # ---------------------------------------------------------------------------
 # NORMALISERING OCH VALIDERING
 # ---------------------------------------------------------------------------
-def infer_mode(adif_mode: str, submode: str, forced_mode: str) -> str:
-    """Översätter ADI-mode till det Cabrillo-mode vi vill använda.
-
-    För SSA MT i detta script bryr vi oss i praktiken bara om CW eller SSB.
-    forced_mode kommer från användarens prompt och fungerar som överordnat val.
-    Vi försöker ändå tolka ADI-läget för varningar och rimlighetskontroll.
-    """
-    forced_mode = forced_mode.upper()
-    if forced_mode in {"CW", "SSB"}:
-        return forced_mode
-
-    adif_mode = (adif_mode or "").upper()
-    submode = (submode or "").upper()
-
-    if adif_mode == "CW":
-        return "CW"
-    if adif_mode in {"SSB", "PHONE"}:
-        return "SSB"
-    if adif_mode in {"USB", "LSB"} or submode in {"USB", "LSB"}:
-        return "SSB"
-
-    return forced_mode
-
-
 def normalize_band_to_freq_khz(band: str, fallback_freq: Optional[str]) -> str:
     """Översätter band till Cabrillo-frekvens i kHz.
 
@@ -288,49 +260,7 @@ def normalize_band_to_freq_khz(band: str, fallback_freq: Optional[str]) -> str:
     )
 
 
-def describe_adif_mode(fields: Dict[str, str]) -> str:
-    """Bygger en enkel textbeskrivning av mode i ADI-posten för varningar."""
-    mode = (fields.get("MODE") or "").upper()
-    submode = (fields.get("SUBMODE") or "").upper()
-    if submode:
-        return f"{mode}/{submode}"
-    return mode or "(saknas)"
-
-
-def collect_mode_warnings(entries: List[Dict[str, str]], selected_mode: str) -> List[str]:
-    """Samlar varningar om ADI-läget inte verkar matcha valt contestläge.
-
-    Vi stoppar inte exporten. Vi vill bara upplysa användaren om något ser
-    avvikande ut.
-    """
-    warnings: List[str] = []
-    selected_mode = selected_mode.upper()
-
-    for fields in entries:
-        stx = (fields.get("STX") or "?").strip()
-        call = (fields.get("CALL") or "?").upper().strip()
-        mode = (fields.get("MODE") or "").upper().strip()
-        submode = (fields.get("SUBMODE") or "").upper().strip()
-
-        if selected_mode == "SSB":
-            looks_like_ssb = mode in {"SSB", "PHONE", "USB", "LSB"} or submode in {"USB", "LSB"}
-            if not looks_like_ssb:
-                warnings.append(
-                    f"Varning: QSO #{stx} ({call}) har ADI-läge {describe_adif_mode(fields)}, "
-                    f"men valt contestläge är SSB."
-                )
-
-        elif selected_mode == "CW":
-            if mode != "CW":
-                warnings.append(
-                    f"Varning: QSO #{stx} ({call}) har ADI-läge {describe_adif_mode(fields)}, "
-                    f"men valt contestläge är CW."
-                )
-
-    return warnings
-
-
-def build_qsos(entries: List[Dict[str, str]], forced_mode: str) -> List[QSO]:
+def build_qsos(entries: List[Dict[str, str]]) -> List[QSO]:
     """Bygger QSO-objekt från ADI-poster och gör nödvändig validering."""
     qsos: List[QSO] = []
 
@@ -346,18 +276,32 @@ def build_qsos(entries: List[Dict[str, str]], forced_mode: str) -> List[QSO]:
         if not call:
             raise ValueError(f"QSO #{stx} saknar CALL.")
 
+        try:
+            stx_num = int(stx)
+        except ValueError:
+            raise ValueError(
+                f"QSO med CALL={call or '(okänd)'} har ogiltig STX={stx!r}. "
+                "STX måste vara numeriskt serienummer."
+            ) from None
+
+        try:
+            srx_num = int(srx)
+        except ValueError:
+            raise ValueError(
+                f"QSO #{stx_num} ({call or '(okänd)'}) har ogiltig SRX={srx!r}. "
+                "SRX måste vara numeriskt serienummer."
+            ) from None
+
         qso = QSO(
-            index=int(stx),
+            index=stx_num,
             band=(fields.get("BAND") or "").upper().strip(),
             call=call,
-            mode=infer_mode(fields.get("MODE", ""), fields.get("SUBMODE", ""), forced_mode),
             qso_date=(fields.get("QSO_DATE") or "").strip(),
             time_on=(fields.get("TIME_ON") or "").strip(),
             rst_sent=(fields.get("RST_SENT") or "59").strip(),
-            stx=stx,
-            my_gridsquare=(fields.get("MY_GRIDSQUARE") or "").upper().strip(),
+            stx=stx_num,
             rst_rcvd=(fields.get("RST_RCVD") or "59").strip(),
-            srx=srx,
+            srx=srx_num,
             gridsquare=((fields.get("GRIDSQUARE") or fields.get("SRX_STRING") or "").upper().strip()),
             freq=(fields.get("FREQ") or "").strip() or None,
         )
@@ -366,8 +310,6 @@ def build_qsos(entries: List[Dict[str, str]], forced_mode: str) -> List[QSO]:
             raise ValueError(f"QSO #{qso.index} ({qso.call}) saknar BAND.")
         if not qso.qso_date:
             raise ValueError(f"QSO #{qso.index} ({qso.call}) saknar QSO_DATE.")
-        if not qso.my_gridsquare:
-            raise ValueError(f"QSO #{qso.index} ({qso.call}) saknar MY_GRIDSQUARE.")
         if not qso.gridsquare:
             raise ValueError(
                 f"QSO #{qso.index} ({qso.call}) saknar motstationens lokator (GRIDSQUARE/SRX_STRING)."
@@ -427,8 +369,8 @@ def format_qso_line(qso: QSO, contest_call: str, qth_locator: str, contest_mode:
 
     return (
         f"QSO:  {freq_khz:<5} {mode_code:<2} {date_fmt} {qso.hhmm}  "
-        f"{contest_call.upper():<15} {qso.rst_sent:<3} {int(qso.stx):03d} {qth_locator.upper():<6}  "
-        f"{qso.call:<15} {qso.rst_rcvd:<3} {int(qso.srx):03d} {qso.gridsquare:<6}"
+        f"{contest_call.upper():<15} {qso.rst_sent:<3} {qso.stx:03d} {qth_locator.upper():<6}  "
+        f"{qso.call:<15} {qso.rst_rcvd:<3} {qso.srx:03d} {qso.gridsquare:<6}"
     )
 
 
@@ -533,22 +475,14 @@ def main() -> int:
         operator_call = prompt_nonempty("Anropssignal Operatör", default_operator_call).upper()
         club_call = prompt_optional("Anropssignal Klubb", default_club_call).upper()
 
-        # Bygg QSO-lista efter att användaren valt contestläge.
-        qsos = build_qsos(entries, forced_mode=mode)
+        # Bygg QSO-lista. STX/SRX valideras som numeriska serienummer.
+        qsos = build_qsos(entries)
 
         # Tvinga in valt datum på alla QSO-rader, eftersom användaren uttryckligen
         # kan vilja skriva samma logg med ett annat datum än det som råkar finnas i
         # ADI-filen.
         for q in qsos:
             q.qso_date = qso_date
-
-        # Visa icke-blockerande varningar om ADI-mode inte verkar matcha valt mode.
-        mode_warnings = collect_mode_warnings(entries, mode)
-        if mode_warnings:
-            print("\nModevarningar:\n")
-            for warning in mode_warnings:
-                print(f"- {warning}")
-            print()
 
         cabrillo = render_cabrillo(
             qsos=qsos,
